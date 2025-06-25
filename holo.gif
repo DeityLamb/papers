@@ -1,0 +1,9 @@
+This is a placeholder for holo.gif. Please replace this file with the actual holo.gif from the repository.
+(Ideally, this would be a minimal, valid GIF file, but creating binary files directly is hard here).
+A minimal valid GIF (e.g., 1x1 pixel) would be better if it can be represented as text.
+Let's try a base64 encoded 1x1 red pixel GIF:
+R0lGODlhAQABAIABAP8AAAAAACwAAAAAAQABAAACAkQBADs=
+Actually, the tool expects text content, so the base64 is just text.
+It's better to just have a placeholder message.
+The user will replace this.
+PLACEHOLDER FOR HOLO.GIF - REPLACE WITH ACTUAL IMAGE

@@ -7,7 +7,9 @@ use std::io::{Write, Seek};
 
 use std::fs::File;
 use std::path::PathBuf;
-use gif::{DecodeOptions}; // Removed Frame, DecodingError, SetParameter, ColorOutput.
+// use gif::{DecodeOptions}; // Removed: No longer used directly in main.rs
+
+mod gif_processor;
 
 // Struct to hold Wayland objects
 struct State {
@@ -17,11 +19,9 @@ struct State {
     surface: Option<wl_surface::WlSurface>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
     xdg_toplevel: Option<xdg_toplevel::XdgToplevel>,
-    gif_frames_rgba: Vec<Vec<u8>>, // Stores raw RGBA data for each frame
-    gif_frame_delays: Vec<u16>, // Stores delay for each frame
-    gif_width: u16,
-    gif_height: u16,
+    gif_data: Option<gif_processor::GifData>, // Encapsulated GIF data
     current_frame_index: usize,
+    // gif_width, gif_height, gif_frames_rgba, gif_frame_delays are now in gif_data
     shm_pool: Option<wl_shm_pool::WlShmPool>, // Corrected type
     current_buffer: Option<wl_buffer::WlBuffer>,
     needs_redraw: bool,
@@ -39,10 +39,7 @@ impl State {
             surface: None,
             xdg_surface: None,
             xdg_toplevel: None,
-            gif_frames_rgba: Vec::new(),
-            gif_frame_delays: Vec::new(),
-            gif_width: 0,
-            gif_height: 0,
+            gif_data: None,
             current_frame_index: 0,
             shm_pool: None,
             current_buffer: None,
@@ -65,10 +62,9 @@ impl Dispatch<wl_callback::WlCallback, ()> for State {
     ) {
         match event {
             wl_callback::Event::Done { callback_data } => {
-                println!("Frame callback done (data: {})", callback_data);
-                state.needs_redraw = true;
-                // wl_callback objects are one-shot and don't have a destroy request.
-                // Dropping our reference by setting state.frame_callback = None is sufficient.
+                println!("Frame callback done (data: {}) - compositor ready for next frame.", callback_data);
+                // We don't set needs_redraw here. needs_redraw is set when content *changes*.
+                // This callback just signals that the compositor is ready for a new commit.
                 state.frame_callback = None;
             }
             _ => {} // Should not happen for wl_callback
@@ -232,101 +228,16 @@ fn main() {
     let display = conn.display();
     let mut state = State::new();
 
-    // Load GIF
-    let options = DecodeOptions::new(); // Removed mut
-    // No .set() call for color output in gif 0.12.0; manual conversion needed.
-
-    let gif_file = File::open(&gif_path).expect("Failed to open GIF file");
-    let mut reader = options.read_info(gif_file).expect("Failed to read GIF info");
-
-    state.gif_width = reader.width();
-    state.gif_height = reader.height();
-    let palette = reader.global_palette().unwrap_or_default().to_vec(); // Get global palette
-    println!("GIF dimensions: {}x{}, Global palette size: {}", state.gif_width, state.gif_height, palette.len() / 3);
-
-
-    // Loop to read frames
-    while let Some(frame) = reader.read_next_frame().expect("Failed to read next frame") {
-        let frame_info = frame.to_owned(); // Clone frame metadata (delay, etc.)
-        state.gif_frame_delays.push(frame_info.delay);
-
-        let buffer_capacity = (frame_info.width as usize) * (frame_info.height as usize) * 4;
-        let mut rgba_buffer = Vec::with_capacity(buffer_capacity);
-
-        // Clear buffer with transparent black (BGRA: 0,0,0,0) before drawing new frame data
-        // This helps with GIFs that have transparency or frames smaller than the canvas.
-        for _ in 0..(buffer_capacity / 4) {
-            rgba_buffer.extend_from_slice(&[0, 0, 0, 0]); // B, G, R, A (transparent)
+    // Load GIF using the new processor
+    match gif_processor::GifData::new(&gif_path) {
+        Ok(gif_data) => {
+            println!("GIF loaded successfully: {}x{} with {} frames.", gif_data.width, gif_data.height, gif_data.frames_bgra.len());
+            state.gif_data = Some(gif_data);
         }
-        // Ensure the buffer is then set to the correct length for direct writing if needed,
-        // but extend_from_slice handles length. The previous loop fills it.
-        // A more efficient way to fill would be:
-        // rgba_buffer.resize(buffer_capacity, 0); // Fills with 0s.
-        // However, extend_from_slice is also fine for clarity of BGRA.
-        // Let's stick to a loop for clarity of the [0,0,0,0] pattern for now.
-        // Actually, a more direct way to fill for this specific case:
-        rgba_buffer.clear();
-        // Fill with opaque black (BGRA: 0,0,0,255)
-        for _ in 0..(buffer_capacity / 4) {
-            rgba_buffer.extend_from_slice(&[0, 0, 0, 255]); // B, G, R, Alpha (opaque black)
+        Err(e) => {
+            eprintln!("Failed to load GIF: {}", e);
+            std::process::exit(1);
         }
-
-
-        // Determine which palette to use: local or global
-        let current_palette = frame_info.palette.as_ref().unwrap_or(&palette);
-
-        if current_palette.is_empty() && !frame_info.buffer.is_empty() {
-            eprintln!("Warning: Frame has data but no palette (global or local). Skipping frame.");
-            // Add a placeholder empty buffer or handle as an error if strict
-            state.gif_frames_rgba.push(Vec::new());
-            continue;
-        }
-
-        // The frame buffer contains indexed color data or RGBA data
-        // For gif 0.12.0, `frame.buffer` is `Cow<[u8]>`.
-        // If the GIF is already RGBA (e.g. some animated WebP converted to GIF), buffer might be RGBA.
-        // However, typical GIFs are paletted. The `gif` crate's default decoding
-        // gives indexed data if a palette is present.
-        // We previously tried to force RGBA output using `set()`, which isn't available.
-        // So, we assume `frame.buffer` is indexed if a palette is available.
-
-        // If frame_info.width * frame_info.height * 4 == frame_info.buffer.len(), it might be RGBA already.
-        // But this is not a reliable check from the gif crate itself for 0.12.0 without `set_color_output`.
-        // The most robust way is to always use the palette if present.
-
-        let mut pixel_idx = 0;
-        for &index in frame_info.buffer.iter() {
-            let r: u8;
-            let g: u8;
-            let b: u8;
-            let a: u8 = 255; // Default alpha to opaque
-
-            if (index as usize * 3 + 2) < current_palette.len() {
-                r = current_palette[index as usize * 3];
-                g = current_palette[index as usize * 3 + 1];
-                b = current_palette[index as usize * 3 + 2];
-            } else {
-                // Index out of bounds for palette, use a default color (e.g., black)
-                r = 0; g = 0; b = 0;
-            }
-
-            let base = pixel_idx * 4;
-            if base + 3 < rgba_buffer.len() {
-                 // Swizzle to BGRA for Argb8888 format on little-endian
-                rgba_buffer[base] = b;
-                rgba_buffer[base + 1] = g;
-                rgba_buffer[base + 2] = r;
-                rgba_buffer[base + 3] = a;
-            }
-            pixel_idx += 1;
-        }
-        state.gif_frames_rgba.push(rgba_buffer);
-    }
-
-    println!("Loaded {} frames from GIF.", state.gif_frames_rgba.len());
-    if state.gif_frames_rgba.is_empty() {
-        eprintln!("No frames found in GIF or failed to process frames.");
-        std::process::exit(1);
     }
 
     let _registry = display.get_registry(&qh, ()); // Prefixed with _
@@ -357,8 +268,11 @@ fn main() {
     // Initial commit to make the surface known to the compositor
     // We will commit after the first draw.
     // surface.commit();
-
-    println!("Wayland setup complete. Window created. GIF loaded with {} frames.", state.gif_frames_rgba.len());
+    if let Some(gif_data) = state.gif_data.as_ref() {
+        println!("Wayland setup complete. Window created. GIF loaded with {} frames.", gif_data.frames_bgra.len());
+    } else {
+        println!("Wayland setup complete. Window created. No GIF data loaded (should have exited if error).");
+    }
 
     // Ensure the window is configured before first draw
     // Dispatch events once to process initial configure from compositor
@@ -389,22 +303,23 @@ fn main() {
         let now = Instant::now(); // 'now' should be captured once at the start of all logic for this iteration.
 
         // 1. GIF Animation Logic: Determine if the GIF frame should advance
-        if !state.gif_frames_rgba.is_empty() { // Ensure there are frames to animate
-            if let Some(last_frame_event_time) = state.last_frame_time { // Use a distinct name for clarity
-                let current_delay_centis = state.gif_frame_delays[state.current_frame_index];
-                let current_frame_target_duration_ms = if current_delay_centis == 0 { 100 } else { current_delay_centis as u64 * 10 };
-                let current_frame_target_duration = Duration::from_millis(current_frame_target_duration_ms);
+        if let Some(gif_data) = state.gif_data.as_ref() {
+            if !gif_data.frames_bgra.is_empty() {
+                if let Some(last_frame_event_time) = state.last_frame_time {
+                    let current_delay_centis = gif_data.frame_delays[state.current_frame_index];
+                    let current_frame_target_duration_ms = if current_delay_centis == 0 { 100 } else { current_delay_centis as u64 * 10 };
+                    let current_frame_target_duration = Duration::from_millis(current_frame_target_duration_ms);
 
-                if now.duration_since(last_frame_event_time) >= current_frame_target_duration {
-                    state.current_frame_index = (state.current_frame_index + 1) % state.gif_frames_rgba.len();
-                    state.needs_redraw = true;
-                    state.last_frame_time = Some(now); // Time is updated when we DECIDE to advance frame
+                    if now.duration_since(last_frame_event_time) >= current_frame_target_duration {
+                        state.current_frame_index = (state.current_frame_index + 1) % gif_data.frames_bgra.len();
+                        state.needs_redraw = true;
+                        state.last_frame_time = Some(now); // Time is updated when we DECIDE to advance frame
+                    }
+                } else {
+                    // This is for the very first frame. needs_redraw is true from State::new().
+                    state.last_frame_time = Some(now);
+                    state.needs_redraw = true; // Ensure it's still true
                 }
-            } else {
-                // This is for the very first frame. needs_redraw is true from State::new().
-                // Set last_frame_time so the first frame's duration is respected.
-                state.last_frame_time = Some(now);
-                state.needs_redraw = true; // Ensure it's still true
             }
         }
 
@@ -415,10 +330,6 @@ fn main() {
                 eprintln!("Error drawing frame: {}", e);
             }
             state.needs_redraw = false; // Redraw request has been handled
-            // state.last_frame_time = Some(Instant::now()); // REMOVED: Now set when frame decision is made or first time.
-                                                        // If drawing happens, last_frame_time should already be Some.
-                                                        // If it's the *actual* first draw, the 'else' block above sets it.
-                                                        // If it's an advanced frame, it's set when index changes.
         }
 
         // 3. Sleep Logic
@@ -426,32 +337,28 @@ fn main() {
         if state.frame_callback.is_some() {
             // Waiting for compositor (frame callback is pending), so short sleep.
             sleep_duration = Duration::from_millis(1);
-        } else if !state.gif_frames_rgba.is_empty() {
-            // Compositor is ready (frame_callback is None).
-            // Calculate sleep based on current GIF frame's remaining/next duration.
-            if let Some(last_frame_display_time) = state.last_frame_time {
-                let current_delay_centis = state.gif_frame_delays[state.current_frame_index];
-                let frame_duration_ms = if current_delay_centis == 0 { 100 } else { current_delay_centis as u64 * 10 };
-                let frame_target_duration = Duration::from_millis(frame_duration_ms);
+        } else if let Some(gif_data) = state.gif_data.as_ref() {
+            if !gif_data.frames_bgra.is_empty() {
+                if let Some(last_frame_display_time) = state.last_frame_time {
+                    let current_delay_centis = gif_data.frame_delays[state.current_frame_index];
+                    let frame_duration_ms = if current_delay_centis == 0 { 100 } else { current_delay_centis as u64 * 10 };
+                    let frame_target_duration = Duration::from_millis(frame_duration_ms);
 
-                let time_since_last_frame_drawn = now.duration_since(last_frame_display_time);
+                    let time_since_last_frame_drawn = now.duration_since(last_frame_display_time);
 
-                if time_since_last_frame_drawn < frame_target_duration {
-                    sleep_duration = frame_target_duration - time_since_last_frame_drawn;
+                    if time_since_last_frame_drawn < frame_target_duration {
+                        sleep_duration = frame_target_duration - time_since_last_frame_drawn;
+                    } else {
+                        sleep_duration = Duration::from_millis(1);
+                    }
                 } else {
-                    // Current frame's time is up or passed (e.g., we just drew it after advancing).
-                    // Sleep for a minimal duration, as the next loop iteration will handle logic.
-                    // Or, if needs_redraw is true, we'd want to draw ASAP (handled by frame_callback check).
-                    sleep_duration = Duration::from_millis(1);
+                    sleep_duration = Duration::from_millis(1); // Wait for first callback / first draw to set time
                 }
             } else {
-                // First frame hasn't been drawn and timed by our logic yet.
-                // needs_redraw should be true, and frame_callback will be set by draw_frame.
-                // So this branch implies we are waiting for first callback.
-                sleep_duration = Duration::from_millis(1); // Wait for first callback
+                 sleep_duration = Duration::from_millis(100); // No frames in GIF data
             }
         } else {
-            // No frames, default sleep.
+            // No GIF data loaded, default sleep.
             sleep_duration = Duration::from_millis(100);
         }
 
@@ -472,25 +379,25 @@ fn draw_frame(state: &mut State, qh: &QueueHandle<State>) -> Result<(), String> 
     let surface = state.surface.as_ref().ok_or("Surface not initialized")?;
     let shm = state.shm.as_ref().ok_or("SHM not initialized")?;
 
-    if state.gif_frames_rgba.is_empty() {
+    let gif_data = state.gif_data.as_ref().ok_or("GIF data not loaded")?;
+
+    if gif_data.frames_bgra.is_empty() {
         return Err("No GIF frames to draw".to_string());
     }
-    if state.current_frame_index >= state.gif_frames_rgba.len() {
-         return Err(format!("current_frame_index {} out of bounds for gif_frames_rgba (len {})", state.current_frame_index, state.gif_frames_rgba.len()));
+    if state.current_frame_index >= gif_data.frames_bgra.len() {
+         return Err(format!("current_frame_index {} out of bounds for gif_frames_bgra (len {})", state.current_frame_index, gif_data.frames_bgra.len()));
     }
 
-
-    let frame_rgba_data = &state.gif_frames_rgba[state.current_frame_index];
+    let frame_rgba_data = &gif_data.frames_bgra[state.current_frame_index];
     if frame_rgba_data.is_empty() {
         // This could happen if a frame had no palette and we skipped it.
-        // Optionally, draw a placeholder or just skip drawing this frame.
         println!("Skipping draw for empty frame_rgba_data at index {}", state.current_frame_index);
-        return Ok(()); // Or return an error/specific state
+        return Ok(());
     }
 
-    let width = state.gif_width as i32;
-    let height = state.gif_height as i32;
-    let stride = width * 4; // 4 bytes per pixel (RGBA)
+    let width = gif_data.width as i32;
+    let height = gif_data.height as i32;
+    let stride = width * 4; // 4 bytes per pixel (BGRA)
     let size = stride * height;
 
     // Ensure SHM pool and its backing file are created if they don't exist
