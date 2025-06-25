@@ -1,4 +1,4 @@
-use wayland_client::{protocol::{wl_compositor, wl_shm, wl_shm_pool, wl_buffer, wl_surface}, Connection, Dispatch, QueueHandle};
+use wayland_client::{protocol::{wl_compositor, wl_shm, wl_shm_pool, wl_buffer, wl_surface, wl_callback}, Connection, Dispatch, QueueHandle};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use std::time::{Duration, Instant};
 use tempfile::tempfile;
@@ -27,6 +27,7 @@ struct State {
     needs_redraw: bool,
     last_frame_time: Option<Instant>,
     current_shm_temp_file: Option<File>, // Changed from tempfile::TempFile to std::fs::File
+    frame_callback: Option<wl_callback::WlCallback>, // For wl_surface.frame
 }
 
 impl State {
@@ -48,6 +49,29 @@ impl State {
             needs_redraw: true, // Start with a redraw request
             last_frame_time: None,
             current_shm_temp_file: None,
+            frame_callback: None,
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for State {
+    fn event(
+        state: &mut Self,
+        _callback: &wl_callback::WlCallback, // Prefixed with _
+        event: wl_callback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_callback::Event::Done { callback_data } => {
+                println!("Frame callback done (data: {})", callback_data);
+                state.needs_redraw = true;
+                // wl_callback objects are one-shot and don't have a destroy request.
+                // Dropping our reference by setting state.frame_callback = None is sufficient.
+                state.frame_callback = None;
+            }
+            _ => {} // Should not happen for wl_callback
         }
     }
 }
@@ -362,56 +386,69 @@ fn main() {
             // state.needs_redraw = false; // This is now handled carefully
         }
 
-        let now = Instant::now();
-        let mut calculated_sleep_duration = Duration::from_millis(100); // Default sleep if no frames
+        let now = Instant::now(); // 'now' should be captured once at the start of all logic for this iteration.
 
-        if !state.gif_frames_rgba.is_empty() {
-            let current_gif_frame_delay_centis = state.gif_frame_delays[state.current_frame_index];
-            let current_gif_frame_duration_ms = if current_gif_frame_delay_centis == 0 { 100 } else { current_gif_frame_delay_centis as u64 * 10 };
-            let current_frame_target_duration = Duration::from_millis(current_gif_frame_duration_ms);
+        // 1. GIF Animation Logic: Determine if the GIF frame should advance
+        if let Some(last_draw_time) = state.last_frame_time {
+            if !state.gif_frames_rgba.is_empty() {
+                let current_delay_centis = state.gif_frame_delays[state.current_frame_index];
+                let current_frame_target_duration_ms = if current_delay_centis == 0 { 100 } else { current_delay_centis as u64 * 10 };
+                let current_frame_target_duration = Duration::from_millis(current_frame_target_duration_ms);
 
-            if let Some(last_display_time) = state.last_frame_time {
-                let elapsed_since_last_display = now.duration_since(last_display_time);
-
-                if elapsed_since_last_display >= current_frame_target_duration {
-                    // Time to advance to the next frame
+                if now.duration_since(last_draw_time) >= current_frame_target_duration {
                     state.current_frame_index = (state.current_frame_index + 1) % state.gif_frames_rgba.len();
-                    state.needs_redraw = true; // Mark that this new frame needs drawing
-                    state.last_frame_time = Some(now); // Record time for this new frame's display start
-
-                    // Sleep for the new current frame's duration
-                    let next_frame_delay_centis = state.gif_frame_delays[state.current_frame_index];
-                    let next_frame_duration_ms = if next_frame_delay_centis == 0 { 100 } else { next_frame_delay_centis as u64 * 10 };
-                    calculated_sleep_duration = Duration::from_millis(next_frame_duration_ms);
-                } else {
-                    // Not yet time to advance, sleep for the remainder of current frame's duration
-                    calculated_sleep_duration = current_frame_target_duration - elapsed_since_last_display;
+                    state.needs_redraw = true; // Request redraw for the new GIF frame
                 }
-            } else {
-                // This is the very first frame to be shown
-                state.needs_redraw = true; // Mark that this first frame needs drawing
-                state.last_frame_time = Some(now); // Record time for this first frame's display start
-                calculated_sleep_duration = current_frame_target_duration;
             }
-        } else {
-            // No frames loaded, ensure needs_redraw is true if we want to display a blank/error state
-            state.needs_redraw = true;
         }
+        // Note: For the very first frame, needs_redraw is initially true.
+        // last_frame_time will be set after the first successful draw.
 
-        // If needs_redraw is true (either from animation logic or other events like configure), draw the frame.
-        if state.needs_redraw {
-            if let Err(e) = draw_frame(&mut state, &qh) {
+        // 2. Drawing Logic: Draw if needed and if compositor is ready (frame_callback is None)
+        if state.needs_redraw && state.frame_callback.is_none() {
+            if let Err(e) = draw_frame(&mut state, &qh) { // draw_frame will request a new frame_callback
                 eprintln!("Error drawing frame: {}", e);
             }
-            state.needs_redraw = false; // Reset after drawing
-            // If last_frame_time was set by animation logic above, it's already up-to-date for the drawn frame.
-            // If it was the very first frame, it was also set above.
+            state.needs_redraw = false; // Redraw request has been handled
+            state.last_frame_time = Some(Instant::now()); // Mark time of this draw
         }
 
-        // Clamp sleep duration to a minimum to prevent busy waiting.
-        // No upper clamp for now, to respect potentially long GIF delays.
-        calculated_sleep_duration = calculated_sleep_duration.max(Duration::from_millis(10));
-        std::thread::sleep(calculated_sleep_duration);
+        // 3. Sleep Logic
+        let mut sleep_duration;
+        if state.frame_callback.is_some() {
+            // Waiting for compositor (frame callback is pending), so short sleep.
+            sleep_duration = Duration::from_millis(1);
+        } else if !state.gif_frames_rgba.is_empty() {
+            // Compositor is ready (frame_callback is None).
+            // Calculate sleep based on current GIF frame's remaining/next duration.
+            if let Some(last_frame_display_time) = state.last_frame_time {
+                let current_delay_centis = state.gif_frame_delays[state.current_frame_index];
+                let frame_duration_ms = if current_delay_centis == 0 { 100 } else { current_delay_centis as u64 * 10 };
+                let frame_target_duration = Duration::from_millis(frame_duration_ms);
+
+                let time_since_last_frame_drawn = now.duration_since(last_frame_display_time);
+
+                if time_since_last_frame_drawn < frame_target_duration {
+                    sleep_duration = frame_target_duration - time_since_last_frame_drawn;
+                } else {
+                    // Current frame's time is up or passed (e.g., we just drew it after advancing).
+                    // Sleep for a minimal duration, as the next loop iteration will handle logic.
+                    // Or, if needs_redraw is true, we'd want to draw ASAP (handled by frame_callback check).
+                    sleep_duration = Duration::from_millis(1);
+                }
+            } else {
+                // First frame hasn't been drawn and timed by our logic yet.
+                // needs_redraw should be true, and frame_callback will be set by draw_frame.
+                // So this branch implies we are waiting for first callback.
+                sleep_duration = Duration::from_millis(1); // Wait for first callback
+            }
+        } else {
+            // No frames, default sleep.
+            sleep_duration = Duration::from_millis(100);
+        }
+
+        sleep_duration = sleep_duration.max(Duration::from_millis(1)); // Ensure minimum sleep.
+        std::thread::sleep(sleep_duration);
 
         // Ensure the connection is flushed, sending requests to the server.
         // dispatch_pending alone does not guarantee a flush.
@@ -484,6 +521,13 @@ fn draw_frame(state: &mut State, qh: &QueueHandle<State>) -> Result<(), String> 
     // 5. Attach the buffer to the surface and commit
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, width, height); // Mark the entire buffer as damaged
+
+    // Request a frame callback if one isn't already pending
+    if state.frame_callback.is_none() {
+        let callback = surface.frame(qh, ());
+        state.frame_callback = Some(callback);
+    }
+
     surface.commit();
 
     println!("Frame {} drawn. Width: {}, Height: {}", state.current_frame_index, width, height);
