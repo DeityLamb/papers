@@ -26,6 +26,7 @@ struct State {
     current_buffer: Option<wl_buffer::WlBuffer>,
     needs_redraw: bool,
     last_frame_time: Option<Instant>,
+    current_shm_temp_file: Option<File>, // Changed from tempfile::TempFile to std::fs::File
 }
 
 impl State {
@@ -46,6 +47,7 @@ impl State {
             current_buffer: None,
             needs_redraw: true, // Start with a redraw request
             last_frame_time: None,
+            current_shm_temp_file: None,
         }
     }
 }
@@ -413,29 +415,43 @@ fn draw_frame(state: &mut State, qh: &QueueHandle<State>) -> Result<(), String> 
     let stride = width * 4; // 4 bytes per pixel (RGBA)
     let size = stride * height;
 
-    // 1. Create a temporary file for shared memory
-    let mut temp_file = tempfile().map_err(|e| format!("Failed to create temp file: {}", e))?;
+    // 1. Create a new temporary file for the current frame's shared memory
+    let new_temp_file = tempfile().map_err(|e| format!("Failed to create temp file: {}", e))?;
+
+    // Make a mutable reference to new_temp_file for writing, as new_temp_file will be moved into state later.
+    // Alternatively, clone its FD if needed by multiple places, but here we just need to write to it once.
+    // For writing, we need &mut File. tempfile() gives File.
+    // We can't directly get &mut from an owned value we plan to move.
+    // So, write to it before moving it to state.
+    let mut temp_file_writer = new_temp_file.try_clone().map_err(|e| format!("Failed to clone temp_file for writing: {}", e))?;
+
 
     // 2. Write pixel data to the temp file
-    temp_file.write_all(frame_rgba_data)
+    temp_file_writer.write_all(frame_rgba_data)
         .map_err(|e| format!("Failed to write to temp file: {}", e))?;
-    temp_file.flush().map_err(|e| format!("Failed to flush temp file: {}", e))?;
+    temp_file_writer.flush().map_err(|e| format!("Failed to flush temp file: {}", e))?;
+    // new_temp_file (File) is still the owner of the FD. temp_file_writer (File) is a cloned FD.
 
-    // 3. Create a wl_shm_pool from the temp file
-    // If a pool already exists, we might be able to reuse it, but let's keep it simple:
-    // Destroy old pool and buffer if they exist.
+    // 3. Destroy old buffer, pool, and close old temp_file by replacing them in State.
+    // The old temp_file (if any) in state.current_shm_temp_file will be dropped when replaced.
     if let Some(old_buffer) = state.current_buffer.take() {
         old_buffer.destroy();
     }
     if let Some(old_pool) = state.shm_pool.take() {
         old_pool.destroy();
+        // The associated old temp file is dropped when state.current_shm_temp_file is replaced below.
     }
 
-    let pool = shm.create_pool(temp_file.as_raw_fd(), size, qh, ());
+    // Store the new temp file in the state. This also drops the previous one.
+    state.current_shm_temp_file = Some(new_temp_file);
+    // Get the FD from the stored temp_file for creating the pool.
+    let pool_fd = state.current_shm_temp_file.as_ref().unwrap().as_raw_fd();
+
+    // 4. Create a wl_shm_pool from the new temp file's FD
+    let pool = shm.create_pool(pool_fd, size, qh, ());
     state.shm_pool = Some(pool.clone());
 
-
-    // 4. Create a wl_buffer from the pool
+    // 5. Create a wl_buffer from the pool
     let buffer = pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, qh, ());
     state.current_buffer = Some(buffer.clone());
 
