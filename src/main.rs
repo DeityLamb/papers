@@ -224,7 +224,7 @@ fn main() {
         let frame_info = frame.to_owned(); // Clone frame metadata (delay, etc.)
         state.gif_frame_delays.push(frame_info.delay);
 
-        let mut rgba_buffer = Vec::with_capacity((frame_info.width * frame_info.height * 4) as usize);
+        let mut rgba_buffer = Vec::with_capacity((frame_info.width as usize) * (frame_info.height as usize) * 4);
 
         // Determine which palette to use: local or global
         let current_palette = frame_info.palette.as_ref().unwrap_or(&palette);
@@ -253,11 +253,12 @@ fn main() {
                 let r = current_palette[index as usize * 3];
                 let g = current_palette[index as usize * 3 + 1];
                 let b = current_palette[index as usize * 3 + 2];
-                rgba_buffer.extend_from_slice(&[r, g, b, 255]); // Add alpha
+                // Swizzle to BGRA for Argb8888 format on little-endian
+                rgba_buffer.extend_from_slice(&[b, g, r, 255]);
             } else {
                 // Index out of bounds for palette, use a default color (e.g., black)
                 // This can happen with corrupt GIFs or if logic is slightly off
-                rgba_buffer.extend_from_slice(&[0, 0, 0, 255]);
+                rgba_buffer.extend_from_slice(&[0, 0, 0, 255]); // B, G, R, A (0,0,0,255)
             }
         }
         state.gif_frames_rgba.push(rgba_buffer);
@@ -326,59 +327,56 @@ fn main() {
             // state.needs_redraw = false; // This is now handled carefully
         }
 
-        let mut sleep_duration = Duration::from_millis(100); // Default sleep if no frames or other logic applies
+        let now = Instant::now();
+        let mut calculated_sleep_duration = Duration::from_millis(100); // Default sleep if no frames
 
         if !state.gif_frames_rgba.is_empty() {
-            let now = Instant::now();
-            let frame_delay_centis = state.gif_frame_delays[state.current_frame_index];
-            // GIF delay is in 1/100ths of a second. 0 is often treated as 10 (100ms).
-            let frame_delay_ms = if frame_delay_centis == 0 { 100 } else { frame_delay_centis as u64 * 10 };
-            let current_frame_duration = Duration::from_millis(frame_delay_ms);
+            let current_gif_frame_delay_centis = state.gif_frame_delays[state.current_frame_index];
+            let current_gif_frame_duration_ms = if current_gif_frame_delay_centis == 0 { 100 } else { current_gif_frame_delay_centis as u64 * 10 };
+            let current_frame_target_duration = Duration::from_millis(current_gif_frame_duration_ms);
 
-            // let mut time_to_next_frame = current_frame_duration; // This variable was unused
+            if let Some(last_display_time) = state.last_frame_time {
+                let elapsed_since_last_display = now.duration_since(last_display_time);
 
-            if let Some(last_time) = state.last_frame_time {
-                let elapsed = now.duration_since(last_time);
-                if elapsed >= current_frame_duration {
+                if elapsed_since_last_display >= current_frame_target_duration {
+                    // Time to advance to the next frame
                     state.current_frame_index = (state.current_frame_index + 1) % state.gif_frames_rgba.len();
-                    state.needs_redraw = true;
-                    state.last_frame_time = Some(now); // Reset timer for the new frame
-                    // The next frame's delay will be calculated in the next iteration
-                    let next_frame_delay_centis = state.gif_frame_delays[state.current_frame_index];
-                    let next_frame_delay_ms = if next_frame_delay_centis == 0 { 100 } else { next_frame_delay_centis as u64 * 10 };
-                    sleep_duration = Duration::from_millis(next_frame_delay_ms);
+                    state.needs_redraw = true; // Mark that this new frame needs drawing
+                    state.last_frame_time = Some(now); // Record time for this new frame's display start
 
+                    // Sleep for the new current frame's duration
+                    let next_frame_delay_centis = state.gif_frame_delays[state.current_frame_index];
+                    let next_frame_duration_ms = if next_frame_delay_centis == 0 { 100 } else { next_frame_delay_centis as u64 * 10 };
+                    calculated_sleep_duration = Duration::from_millis(next_frame_duration_ms);
                 } else {
-                    // Not yet time to switch frames, sleep for the remaining duration
-                    // time_to_next_frame = current_frame_duration - elapsed; // Unused
-                    sleep_duration = current_frame_duration - elapsed;
+                    // Not yet time to advance, sleep for the remainder of current frame's duration
+                    calculated_sleep_duration = current_frame_target_duration - elapsed_since_last_display;
                 }
             } else {
-                // First frame, or after a long pause
-                state.needs_redraw = true; // Ensure first frame is drawn
-                state.last_frame_time = Some(now);
-                sleep_duration = current_frame_duration;
+                // This is the very first frame to be shown
+                state.needs_redraw = true; // Mark that this first frame needs drawing
+                state.last_frame_time = Some(now); // Record time for this first frame's display start
+                calculated_sleep_duration = current_frame_target_duration;
             }
-             // Clamp sleep duration to a minimum to prevent busy waiting on very fast GIFs,
-             // and a maximum to ensure responsiveness.
-            sleep_duration = sleep_duration.max(Duration::from_millis(10)).min(Duration::from_millis(1000));
-
         } else {
-            state.needs_redraw = true; // e.g. draw a static background or error if no frames
+            // No frames loaded, ensure needs_redraw is true if we want to display a blank/error state
+            state.needs_redraw = true;
         }
 
-
+        // If needs_redraw is true (either from animation logic or other events like configure), draw the frame.
         if state.needs_redraw {
             if let Err(e) = draw_frame(&mut state, &qh) {
                 eprintln!("Error drawing frame: {}", e);
             }
             state.needs_redraw = false; // Reset after drawing
-            if state.last_frame_time.is_none() && !state.gif_frames_rgba.is_empty() { // Check gif_frames_rgba
-                 state.last_frame_time = Some(Instant::now()); // Set time if it was the very first draw
-            }
+            // If last_frame_time was set by animation logic above, it's already up-to-date for the drawn frame.
+            // If it was the very first frame, it was also set above.
         }
 
-        std::thread::sleep(sleep_duration);
+        // Clamp sleep duration to a minimum to prevent busy waiting.
+        // No upper clamp for now, to respect potentially long GIF delays.
+        calculated_sleep_duration = calculated_sleep_duration.max(Duration::from_millis(10));
+        std::thread::sleep(calculated_sleep_duration);
 
         // Ensure the connection is flushed, sending requests to the server.
         // dispatch_pending alone does not guarantee a flush.
