@@ -241,8 +241,11 @@ fn main() {
         // However, extend_from_slice is also fine for clarity of BGRA.
         // Let's stick to a loop for clarity of the [0,0,0,0] pattern for now.
         // Actually, a more direct way to fill for this specific case:
-        rgba_buffer.clear(); // Should be empty from previous iteration if we re-use a buffer, but new Vec here.
-        rgba_buffer.resize(buffer_capacity, 0); // Fill with 0s (effectively [0,0,0,0] for BGRA)
+        rgba_buffer.clear();
+        // Fill with opaque black (BGRA: 0,0,0,255)
+        for _ in 0..(buffer_capacity / 4) {
+            rgba_buffer.extend_from_slice(&[0, 0, 0, 255]); // B, G, R, Alpha (opaque black)
+        }
 
 
         // Determine which palette to use: local or global
