@@ -389,20 +389,25 @@ fn main() {
         let now = Instant::now(); // 'now' should be captured once at the start of all logic for this iteration.
 
         // 1. GIF Animation Logic: Determine if the GIF frame should advance
-        if let Some(last_draw_time) = state.last_frame_time {
-            if !state.gif_frames_rgba.is_empty() {
+        if !state.gif_frames_rgba.is_empty() { // Ensure there are frames to animate
+            if let Some(last_frame_event_time) = state.last_frame_time { // Use a distinct name for clarity
                 let current_delay_centis = state.gif_frame_delays[state.current_frame_index];
                 let current_frame_target_duration_ms = if current_delay_centis == 0 { 100 } else { current_delay_centis as u64 * 10 };
                 let current_frame_target_duration = Duration::from_millis(current_frame_target_duration_ms);
 
-                if now.duration_since(last_draw_time) >= current_frame_target_duration {
+                if now.duration_since(last_frame_event_time) >= current_frame_target_duration {
                     state.current_frame_index = (state.current_frame_index + 1) % state.gif_frames_rgba.len();
-                    state.needs_redraw = true; // Request redraw for the new GIF frame
+                    state.needs_redraw = true;
+                    state.last_frame_time = Some(now); // Time is updated when we DECIDE to advance frame
                 }
+            } else {
+                // This is for the very first frame. needs_redraw is true from State::new().
+                // Set last_frame_time so the first frame's duration is respected.
+                state.last_frame_time = Some(now);
+                state.needs_redraw = true; // Ensure it's still true
             }
         }
-        // Note: For the very first frame, needs_redraw is initially true.
-        // last_frame_time will be set after the first successful draw.
+
 
         // 2. Drawing Logic: Draw if needed and if compositor is ready (frame_callback is None)
         if state.needs_redraw && state.frame_callback.is_none() {
@@ -410,7 +415,10 @@ fn main() {
                 eprintln!("Error drawing frame: {}", e);
             }
             state.needs_redraw = false; // Redraw request has been handled
-            state.last_frame_time = Some(Instant::now()); // Mark time of this draw
+            // state.last_frame_time = Some(Instant::now()); // REMOVED: Now set when frame decision is made or first time.
+                                                        // If drawing happens, last_frame_time should already be Some.
+                                                        // If it's the *actual* first draw, the 'else' block above sets it.
+                                                        // If it's an advanced frame, it's set when index changes.
         }
 
         // 3. Sleep Logic
