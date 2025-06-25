@@ -3,7 +3,7 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 use std::time::{Duration, Instant};
 use tempfile::tempfile;
 use std::os::unix::io::AsRawFd;
-use std::io::Write;
+use std::io::{Write, Seek};
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -226,7 +226,24 @@ fn main() {
         let frame_info = frame.to_owned(); // Clone frame metadata (delay, etc.)
         state.gif_frame_delays.push(frame_info.delay);
 
-        let mut rgba_buffer = Vec::with_capacity((frame_info.width as usize) * (frame_info.height as usize) * 4);
+        let buffer_capacity = (frame_info.width as usize) * (frame_info.height as usize) * 4;
+        let mut rgba_buffer = Vec::with_capacity(buffer_capacity);
+
+        // Clear buffer with transparent black (BGRA: 0,0,0,0) before drawing new frame data
+        // This helps with GIFs that have transparency or frames smaller than the canvas.
+        for _ in 0..(buffer_capacity / 4) {
+            rgba_buffer.extend_from_slice(&[0, 0, 0, 0]); // B, G, R, A (transparent)
+        }
+        // Ensure the buffer is then set to the correct length for direct writing if needed,
+        // but extend_from_slice handles length. The previous loop fills it.
+        // A more efficient way to fill would be:
+        // rgba_buffer.resize(buffer_capacity, 0); // Fills with 0s.
+        // However, extend_from_slice is also fine for clarity of BGRA.
+        // Let's stick to a loop for clarity of the [0,0,0,0] pattern for now.
+        // Actually, a more direct way to fill for this specific case:
+        rgba_buffer.clear(); // Should be empty from previous iteration if we re-use a buffer, but new Vec here.
+        rgba_buffer.resize(buffer_capacity, 0); // Fill with 0s (effectively [0,0,0,0] for BGRA)
+
 
         // Determine which palette to use: local or global
         let current_palette = frame_info.palette.as_ref().unwrap_or(&palette);
@@ -250,18 +267,31 @@ fn main() {
         // But this is not a reliable check from the gif crate itself for 0.12.0 without `set_color_output`.
         // The most robust way is to always use the palette if present.
 
+        let mut pixel_idx = 0;
         for &index in frame_info.buffer.iter() {
+            let r: u8;
+            let g: u8;
+            let b: u8;
+            let a: u8 = 255; // Default alpha to opaque
+
             if (index as usize * 3 + 2) < current_palette.len() {
-                let r = current_palette[index as usize * 3];
-                let g = current_palette[index as usize * 3 + 1];
-                let b = current_palette[index as usize * 3 + 2];
-                // Swizzle to BGRA for Argb8888 format on little-endian
-                rgba_buffer.extend_from_slice(&[b, g, r, 255]);
+                r = current_palette[index as usize * 3];
+                g = current_palette[index as usize * 3 + 1];
+                b = current_palette[index as usize * 3 + 2];
             } else {
                 // Index out of bounds for palette, use a default color (e.g., black)
-                // This can happen with corrupt GIFs or if logic is slightly off
-                rgba_buffer.extend_from_slice(&[0, 0, 0, 255]); // B, G, R, A (0,0,0,255)
+                r = 0; g = 0; b = 0;
             }
+
+            let base = pixel_idx * 4;
+            if base + 3 < rgba_buffer.len() {
+                 // Swizzle to BGRA for Argb8888 format on little-endian
+                rgba_buffer[base] = b;
+                rgba_buffer[base + 1] = g;
+                rgba_buffer[base + 2] = r;
+                rgba_buffer[base + 3] = a;
+            }
+            pixel_idx += 1;
         }
         state.gif_frames_rgba.push(rgba_buffer);
     }
@@ -415,43 +445,35 @@ fn draw_frame(state: &mut State, qh: &QueueHandle<State>) -> Result<(), String> 
     let stride = width * 4; // 4 bytes per pixel (RGBA)
     let size = stride * height;
 
-    // 1. Create a new temporary file for the current frame's shared memory
-    let new_temp_file = tempfile().map_err(|e| format!("Failed to create temp file: {}", e))?;
+    // Ensure SHM pool and its backing file are created if they don't exist
+    if state.shm_pool.is_none() {
+        let temp_file = tempfile().map_err(|e| format!("Failed to create temp file: {}", e))?;
+        state.current_shm_temp_file = Some(temp_file);
 
-    // Make a mutable reference to new_temp_file for writing, as new_temp_file will be moved into state later.
-    // Alternatively, clone its FD if needed by multiple places, but here we just need to write to it once.
-    // For writing, we need &mut File. tempfile() gives File.
-    // We can't directly get &mut from an owned value we plan to move.
-    // So, write to it before moving it to state.
-    let mut temp_file_writer = new_temp_file.try_clone().map_err(|e| format!("Failed to clone temp_file for writing: {}", e))?;
+        let pool_fd = state.current_shm_temp_file.as_ref().unwrap().as_raw_fd();
+        let pool = shm.create_pool(pool_fd, size, qh, ());
+        state.shm_pool = Some(pool);
+        println!("Created new SHM pool and temp_file.");
+    }
 
+    // Get the current temp_file to write into.
+    // We need to seek to the beginning before writing each frame's data.
+    let current_temp_file = state.current_shm_temp_file.as_mut()
+        .ok_or("SHM temp_file not available even after creation attempt")?;
 
-    // 2. Write pixel data to the temp file
-    temp_file_writer.write_all(frame_rgba_data)
+    current_temp_file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| format!("Failed to seek to start of temp file: {}", e))?;
+    current_temp_file.write_all(frame_rgba_data)
         .map_err(|e| format!("Failed to write to temp file: {}", e))?;
-    temp_file_writer.flush().map_err(|e| format!("Failed to flush temp file: {}", e))?;
-    // new_temp_file (File) is still the owner of the FD. temp_file_writer (File) is a cloned FD.
+    current_temp_file.flush()
+        .map_err(|e| format!("Failed to flush temp file: {}", e))?;
 
-    // 3. Destroy old buffer, pool, and close old temp_file by replacing them in State.
-    // The old temp_file (if any) in state.current_shm_temp_file will be dropped when replaced.
+    // Destroy old buffer before creating a new one from the (potentially same) pool
     if let Some(old_buffer) = state.current_buffer.take() {
         old_buffer.destroy();
     }
-    if let Some(old_pool) = state.shm_pool.take() {
-        old_pool.destroy();
-        // The associated old temp file is dropped when state.current_shm_temp_file is replaced below.
-    }
 
-    // Store the new temp file in the state. This also drops the previous one.
-    state.current_shm_temp_file = Some(new_temp_file);
-    // Get the FD from the stored temp_file for creating the pool.
-    let pool_fd = state.current_shm_temp_file.as_ref().unwrap().as_raw_fd();
-
-    // 4. Create a wl_shm_pool from the new temp file's FD
-    let pool = shm.create_pool(pool_fd, size, qh, ());
-    state.shm_pool = Some(pool.clone());
-
-    // 5. Create a wl_buffer from the pool
+    let pool = state.shm_pool.as_ref().unwrap(); // Should exist now
     let buffer = pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, qh, ());
     state.current_buffer = Some(buffer.clone());
 
